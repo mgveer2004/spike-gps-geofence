@@ -1,0 +1,45 @@
+# DRAVYA - SPIKE PROJECT CONTEXT
+We are building an isolated technical spike for "Dravya", an enterprise B2B SaaS for pharmaceutical field force automation. 
+The goal of this spike is to validate on-device GPS tracking, the Geofence State Machine, and the Offline-First Sync outbox before integrating it into the main app.
+
+## SPIKE DATA MODEL & SCHEMA
+Cursor, you must adhere strictly to this simplified data model for this spike.
+
+**1. Remote Supabase Table (Dummy Data Source)**
+Table Name: `test_route_stops`
+- `id` (UUID, Primary Key)
+- `doctor_name` (Text)
+- `latitude` (Numeric)
+- `longitude` (Numeric)
+- `geofence_radius_m` (Numeric, default 50)
+
+**2. Local Offline Outbox (SQLite / AsyncStorage)**
+Because MRs lose internet indoors, geofence exits must be saved locally first. 
+Table/Storage Name: `local_sync_outbox`
+- `client_uuid` (Generated on-device for idempotent replay)
+- `payload_type` (String: 'GEOFENCE_EXIT_FORM')
+- `visit_data` (JSON: contains doctor_id, exit_timestamp, and form answers)
+- `sync_status` (String: 'PENDING' | 'SYNCED')
+
+## TECH STACK & STRICT DIRECTIVES
+- **Framework:** React Native via Expo (SDK 50+ / latest LTS).
+- **Location Sensor:** `expo-location` (Foreground `watchPositionAsync` ONLY. No background OS tasks).
+- **Distance Math Engine:** All distance calculations must be done on-device using a local Haversine formula in plain JavaScript. NEVER call Google APIs for distance.
+
+## THE VISIT LIFECYCLE (STATE MACHINE)
+The app strictly follows this state machine: `PLANNED` → `ARRIVED` → `AWAITING_FORM`. Default state is `PLANNED`.
+
+## RULE 1: GEOFENCE ENTRY (PLANNED → ARRIVED)
+- **Trigger:** Immediate. The transition from `PLANNED` to `ARRIVED` happens on the *first valid GPS fix* that drops below the `geofence_radius_m` (50m).
+
+## RULE 2: GPS EXIT-CONFIRMATION PROTOCOL (ARRIVED → AWAITING_FORM)
+Urban GPS drift indoors will falsely place the MR outside the geofence. To prevent false exits, you MUST implement this logic exactly:
+- **Mechanism:** When the state is `ARRIVED`, the app must maintain a short rolling window array of the last 5 to 10 GNSS fixes.
+- **Accuracy Filter:** Discard any fix from the window entirely if its `accuracy` value exceeds 20 meters.
+- **Majority Vote:** The exit fires ONLY when a **majority** of the valid fixes in the window agree the MR is >50m outside the radius. Do not require unanimous agreement.
+- **Implicit Reset:** If the majority swings back to "inside" before the exit threshold is reached, the state silently remains `ARRIVED`.
+
+## RULE 3: OFFLINE-FIRST SYNC
+- When the state changes to `AWAITING_FORM` and the user submits the dummy form, DO NOT push directly to Supabase.
+- Save the payload to the `local_sync_outbox` with a `sync_status` of `PENDING`.
+- Only after saving locally should the app attempt to push `PENDING` records to Supabase.
