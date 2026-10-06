@@ -1,24 +1,47 @@
 import { StyleSheet, Text, View } from 'react-native';
 
-import { EXIT_MIN_VALID_FIXES } from '@/geofence/config';
+import { EXIT_MIN_VALID_FIXES, EXIT_WINDOW_SIZE } from '@/geofence/config';
 import { summarizeVote } from '@/geofence/state-machine';
 import type { MachineState } from '@/geofence/state-machine';
 
-/** Shows WHY the exit protocol decided what it decided. Only relevant while ARRIVED / AWAITING_FORM. */
+/** Epoch ms -> local HH:MM:SS, or '--' when there is no timestamp. */
+function clock(timestamp: number | null): string {
+  if (timestamp === null) return '--';
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
+/**
+ * Shows WHY the geofence logic decided what it decided.
+ * Only relevant once the MR is on-site: ARRIVED / DORMANT / AWAITING_FORM.
+ */
 export function ExitDebugPanel({ machine }: { machine: MachineState }) {
   if (machine.status === 'PLANNED') return null;
 
   const vote = summarizeVote(machine.window);
   // Newest first, so the latest fix is at the top.
   const rows = [...machine.recent].reverse();
+  const dormant = machine.status === 'DORMANT';
 
   return (
-    <View style={styles.panel} pointerEvents="none">
+    <View style={[styles.panel, dormant && styles.panelDormant]} pointerEvents="none">
       <Text style={styles.header}>
         Exit vote: {vote.outsideCount} outside / {vote.insideCount} inside of {vote.validCount} valid
       </Text>
       <Text style={styles.subHeader}>
         Needs a majority outside and at least {EXIT_MIN_VALID_FIXES} valid fixes
+      </Text>
+      <Text style={styles.stat}>
+        Window: {machine.window.length}/{EXIT_WINDOW_SIZE} valid | exit confirmed:{' '}
+        {vote.exitConfirmed ? 'YES' : 'no'}
+      </Text>
+      <Text style={styles.stat}>Last accepted fix: {clock(machine.lastAcceptedFixTimestamp)}</Text>
+      <Text style={[styles.stat, dormant && styles.statDormant]}>
+        Dormant since: {clock(machine.dormantSince)}
       </Text>
       {rows.length === 0 ? <Text style={styles.row}>Waiting for fixes...</Text> : null}
       {rows.map((e, i) => (
@@ -42,8 +65,11 @@ const styles = StyleSheet.create({
     padding: 10,
     gap: 1,
   },
+  panelDormant: { backgroundColor: 'rgba(254,243,199,0.97)' },
   header: { fontSize: 13, fontWeight: '700', color: '#111' },
   subHeader: { fontSize: 11, color: '#666', marginBottom: 4 },
+  stat: { fontSize: 12, color: '#222', fontFamily: 'monospace' },
+  statDormant: { color: '#92400E', fontWeight: '700' },
   row: { fontSize: 12, color: '#222', fontFamily: 'monospace' },
   discarded: { color: '#B00020' },
 });

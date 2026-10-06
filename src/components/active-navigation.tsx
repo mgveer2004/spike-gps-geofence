@@ -5,8 +5,17 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ExitDebugPanel } from '@/components/exit-debug-panel';
 import { ExitModal } from '@/components/exit-modal';
+import { DORMANT_SILENCE_MS } from '@/geofence/config';
 import { useVisitTracker } from '@/hooks/use-visit-tracker';
-import type { ExitAnswer, Stop } from '@/types/geofence';
+import type { ExitAnswer, Stop, VisitStatus } from '@/types/geofence';
+
+/** Banner badge look per status. DORMANT is amber: still on-site, but GPS has gone quiet. */
+const STATUS_BADGES: Record<VisitStatus, { label: string; background: string; text: string }> = {
+  PLANNED: { label: 'PLANNED', background: '#E5E7EB', text: '#374151' },
+  ARRIVED: { label: 'ARRIVED', background: '#D1FAE5', text: '#065F46' },
+  DORMANT: { label: 'GPS SILENT / ON-SITE', background: '#FDE68A', text: '#92400E' },
+  AWAITING_FORM: { label: 'AWAITING FORM', background: '#DBEAFE', text: '#1E40AF' },
+};
 
 export type VisitResult = {
   stop: Stop;
@@ -26,6 +35,7 @@ export function ActiveNavigation({ target, onSubmit }: Props) {
   const { machine, gpsError } = useVisitTracker(target);
   const [submitting, setSubmitting] = useState(false);
 
+  const badge = STATUS_BADGES[machine.status];
   const distanceText = machine.distanceM === null ? '--' : Math.round(machine.distanceM).toString();
   const accuracy = machine.lastFix?.accuracy;
   const accuracyText = accuracy === null || accuracy === undefined ? '--' : `${Math.round(accuracy)} m`;
@@ -73,13 +83,29 @@ export function ActiveNavigation({ target, onSubmit }: Props) {
 
       <SafeAreaView style={styles.bannerWrap} edges={['top']} pointerEvents="none">
         <View style={styles.banner}>
-          <Text style={styles.bannerStatus}>Status: {machine.status}</Text>
+          <View style={styles.statusRow}>
+            <Text style={styles.bannerStatusLabel}>Status:</Text>
+            <View style={[styles.badge, { backgroundColor: badge.background }]}>
+              <Text style={[styles.badgeText, { color: badge.text }]}>{badge.label}</Text>
+            </View>
+          </View>
+          {machine.status === 'DORMANT' ? (
+            <Text style={styles.dormantHint}>
+              No accurate GPS for {Math.round(DORMANT_SILENCE_MS / 1000)} s. Still counted as on-site; it
+              resumes automatically when a good fix arrives.
+            </Text>
+          ) : null}
           <Text style={styles.bannerDistance}>Distance: {distanceText} meters</Text>
           <Text style={styles.bannerTarget}>Target: {target.doctor_name}</Text>
           <Text style={styles.debug}>
             GPS accuracy: {accuracyText} | fixes: {machine.fixCount}
           </Text>
-          {gpsError ? <Text style={styles.error}>GPS error: {gpsError}</Text> : null}
+          {gpsError ? (
+            <View style={styles.errorBox}>
+              <Text style={styles.errorTitle}>Location tracking problem</Text>
+              <Text style={styles.error}>{gpsError}</Text>
+            </View>
+          ) : null}
         </View>
       </SafeAreaView>
 
@@ -105,9 +131,22 @@ const styles = StyleSheet.create({
     gap: 2,
     marginTop: 8,
   },
-  bannerStatus: { fontSize: 18, fontWeight: '800', color: '#111' },
+  statusRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  bannerStatusLabel: { fontSize: 18, fontWeight: '800', color: '#111' },
+  badge: { borderRadius: 999, paddingHorizontal: 10, paddingVertical: 3 },
+  badgeText: { fontSize: 14, fontWeight: '800' },
+  dormantHint: { fontSize: 12, color: '#92400E' },
   bannerDistance: { fontSize: 16, color: '#111' },
   bannerTarget: { fontSize: 13, color: '#666' },
   debug: { fontSize: 12, color: '#444', fontFamily: 'monospace' },
+  errorBox: {
+    marginTop: 4,
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: '#FDE8EA',
+    borderWidth: 1,
+    borderColor: '#B00020',
+  },
+  errorTitle: { fontSize: 12, fontWeight: '800', color: '#B00020' },
   error: { fontSize: 12, color: '#B00020' },
 });

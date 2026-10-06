@@ -23,23 +23,36 @@ Table/Storage Name: `local_sync_outbox`
 
 ## TECH STACK & STRICT DIRECTIVES
 - **Framework:** React Native via Expo (SDK 50+ / latest LTS).
-- **Location Sensor:** `expo-location` (Foreground `watchPositionAsync` ONLY. No background OS tasks).
+- **Location Sensor:** `expo-location` (Foreground `watchPositionAsync` ONLY. No background OS tasks). Use `Accuracy.High`, a 5-second Android `timeInterval` and a small non-zero `distanceInterval`. NEVER use `distanceInterval: 0` (continuous polling drains the MR's battery).
 - **Distance Math Engine:** All distance calculations must be done on-device using a local Haversine formula in plain JavaScript. NEVER call Google APIs for distance.
 
 ## THE VISIT LIFECYCLE (STATE MACHINE)
-The app strictly follows this state machine: `PLANNED` → `ARRIVED` → `AWAITING_FORM`. Default state is `PLANNED`.
+The main path is strictly: `PLANNED` → `ARRIVED` → `AWAITING_FORM`. Default state is `PLANNED`.
+
+There is one additional status, `DORMANT`. It is an **ephemeral, client-side-only sub-state of `ARRIVED`** (the MR is still on-site, but GPS has gone silent, e.g. in a basement).
+- `DORMANT` lives only in the in-memory state machine and the UI. It is NEVER written to `test_route_stops`, NEVER stored in `local_sync_outbox`, and NEVER sent to Supabase. No schema, outbox, or sync code may know about it. Outbox `sync_status` stays strictly `'PENDING' | 'SYNCED'`.
+- It is not a visit outcome and it does not add or remove any visit data.
 
 ## RULE 1: GEOFENCE ENTRY (PLANNED → ARRIVED)
-- **Trigger:** Immediate. The transition from `PLANNED` to `ARRIVED` happens on the *first valid GPS fix* that drops below the `geofence_radius_m` (50m).
+- **Trigger:** Immediate. The transition from `PLANNED` to `ARRIVED` happens on the *first valid GPS fix* that drops below the `geofence_radius_m` (50m) AND passes the accuracy filter (accuracy known and <= 20m). A single inaccurate scatter fix must never trigger an arrival.
 
 ## RULE 2: GPS EXIT-CONFIRMATION PROTOCOL (ARRIVED → AWAITING_FORM)
 Urban GPS drift indoors will falsely place the MR outside the geofence. To prevent false exits, you MUST implement this logic exactly:
-- **Mechanism:** When the state is `ARRIVED`, the app must maintain a short rolling window array of the last 5 to 10 GNSS fixes.
+- **Mechanism:** When the state is `ARRIVED` (or `DORMANT`), the app must maintain a short rolling window array of the last 5 to 10 GNSS fixes.
 - **Accuracy Filter:** Discard any fix from the window entirely if its `accuracy` value exceeds 20 meters.
 - **Majority Vote:** The exit fires ONLY when a **majority** of the valid fixes in the window agree the MR is >50m outside the radius. Do not require unanimous agreement.
 - **Implicit Reset:** If the majority swings back to "inside" before the exit threshold is reached, the state silently remains `ARRIVED`.
+
+## RULE 2B: DORMANT (GPS SILENCE, ARRIVED ↔ DORMANT)
+- **Silence detection is timestamp-based:** `now - lastAcceptedFixTimestamp >= DORMANT_SILENCE_MS` (30s), checked by a periodic clock tick. Never count ticks or fixes.
+- **Only accepted (accurate) fixes count as signal.** Inaccurate fixes (e.g. 100m cell-tower pings) do not reset the silence clock, so weak signals cannot keep the machine out of `DORMANT`.
+- **Only `ARRIVED` can go `DORMANT`.** `PLANNED` and `AWAITING_FORM` never do.
+- **Wake-up:** only an accepted fix wakes `DORMANT`. It is processed like any `ARRIVED` fix: it joins the vote window and returns the status to `ARRIVED`, or triggers `AWAITING_FORM` if it completes the majority-outside vote. Inaccurate fixes while `DORMANT` must not change the status (no flicker).
+- The vote window is preserved across a `DORMANT` spell.
+- All numbers live in `src/geofence/config.ts`. Logic is pure and covered by `npm run check:logic`.
 
 ## RULE 3: OFFLINE-FIRST SYNC
 - When the state changes to `AWAITING_FORM` and the user submits the dummy form, DO NOT push directly to Supabase.
 - Save the payload to the `local_sync_outbox` with a `sync_status` of `PENDING`.
 - Only after saving locally should the app attempt to push `PENDING` records to Supabase.
+- `DORMANT` is never part of any outbox payload or sync request (see Visit Lifecycle).

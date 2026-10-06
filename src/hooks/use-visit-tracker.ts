@@ -1,15 +1,27 @@
 import * as Location from 'expo-location';
 import { useEffect, useReducer, useState } from 'react';
 
-import { MAX_FIX_AGE_MS } from '@/geofence/config';
-import { createInitialState, reduceFix } from '@/geofence/state-machine';
+import {
+  DORMANT_CHECK_INTERVAL_MS,
+  LOCATION_DISTANCE_INTERVAL_M,
+  LOCATION_TIME_INTERVAL_MS,
+  MAX_FIX_AGE_MS,
+} from '@/geofence/config';
+import { createInitialState, reduceFix, reduceTick } from '@/geofence/state-machine';
 import type { GeofenceTarget, MachineState } from '@/geofence/state-machine';
 import type { GpsFix, Stop } from '@/types/geofence';
 
-type Action = { type: 'FIX'; fix: GpsFix; target: GeofenceTarget };
+type Action =
+  | { type: 'FIX'; fix: GpsFix; target: GeofenceTarget }
+  | { type: 'TICK'; now: number };
 
 function reducer(state: MachineState, action: Action): MachineState {
-  return reduceFix(state, action.fix, action.target);
+  switch (action.type) {
+    case 'FIX':
+      return reduceFix(state, action.fix, action.target);
+    case 'TICK':
+      return reduceTick(state, action.now);
+  }
 }
 
 function toFix(loc: Location.LocationObject): GpsFix {
@@ -24,7 +36,10 @@ function toFix(loc: Location.LocationObject): GpsFix {
 /**
  * Foreground GPS tracking for ONE target doctor.
  * - Subscribes with `watchPositionAsync` on mount, unsubscribes on unmount (no background tasks).
+ *   Pacing is a 5 s Android time interval plus a small distance interval, never continuous polling.
  * - Feeds every fresh fix into the pure geofence state machine.
+ * - Runs a lightweight clock tick so the state machine can detect GPS silence (ARRIVED -> DORMANT)
+ *   from timestamps. A DORMANT status wakes up by itself when the next fix arrives.
  * Mount it with `key={stop.id}` so a new target starts from a clean PLANNED state.
  */
 export function useVisitTracker(stop: Stop) {
@@ -40,13 +55,14 @@ export function useVisitTracker(stop: Stop) {
 
     Location.watchPositionAsync(
       {
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 1000, // Android: at most one update per second
-        distanceInterval: 1, // iOS: update when moved at least 1 m
+        accuracy: Location.Accuracy.High,
+        timeInterval: LOCATION_TIME_INTERVAL_MS, // Android: at most one update per 5 s
+        distanceInterval: LOCATION_DISTANCE_INTERVAL_M, // iOS (and Android): minimum movement in meters
       },
       (loc) => {
         // Ignore stale cached positions the OS may hand us first.
         if (Date.now() - loc.timestamp > MAX_FIX_AGE_MS) return;
+        setGpsError(null); // fixes are flowing again, so any earlier runtime error is resolved
         dispatch({ type: 'FIX', fix: toFix(loc), target });
       },
       (reason) => setGpsError(reason),
@@ -64,6 +80,15 @@ export function useVisitTracker(stop: Stop) {
       subscription?.remove();
     };
   }, [latitude, longitude, geofence_radius_m]);
+
+  // Silence detection: silence means no fixes, so a fix callback can never notice it. A plain
+  // interval hands the current time to the state machine, which compares it with the last fix's
+  // timestamp. If JS timers are paused (e.g. app backgrounded), the next tick after resume still
+  // sees the full gap because the decision is timestamp-based, not tick-count-based.
+  useEffect(() => {
+    const id = setInterval(() => dispatch({ type: 'TICK', now: Date.now() }), DORMANT_CHECK_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
 
   return { machine, gpsError };
 }
