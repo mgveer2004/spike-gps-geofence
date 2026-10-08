@@ -51,6 +51,19 @@ export type MachineState = {
   exitTimestamp: number | null;
   /** Clock time (epoch ms) at which silence was detected. Non-null only while DORMANT. */
   dormantSince: number | null;
+  /**
+   * Divert freeze gate. While true, the Divert modal is open and the machine refuses every status
+   * change: fixes only refresh lastFix / distanceM / fixCount, the vote window and exitTimestamp are
+   * untouched, and clock ticks are ignored. This is NOT a visit status (VisitStatus is unchanged); the
+   * real status underneath decides which reasons the modal offers. Client-side only, never persisted.
+   */
+  diverting: boolean;
+  /**
+   * Timestamp (epoch ms) of the fix that caused PLANNED -> ARRIVED. Set once on arrival and never
+   * overwritten (lastAcceptedFixTimestamp keeps moving and dormantSince is the silence clock, so
+   * neither can answer "how long has the MR been on-site?"). Null until ARRIVED.
+   */
+  arrivedAt: number | null;
 };
 
 export type VoteSummary = {
@@ -74,6 +87,8 @@ export function createInitialState(): MachineState {
     recent: [],
     exitTimestamp: null,
     dormantSince: null,
+    diverting: false,
+    arrivedAt: null,
   };
 }
 
@@ -118,12 +133,19 @@ export function summarizeVote(window: FixLogEntry[]): VoteSummary {
  *                  is not confirmed, the status returns to ARRIVED. Inaccurate fixes do not wake the
  *                  machine, otherwise it would flap between ARRIVED and DORMANT on weak signals.
  * AWAITING_FORM is terminal for this target: the screen must be re-mounted for the next doctor.
+ * DIVERT FREEZE:  while `diverting` is true the fix may only refresh lastFix / distanceM / fixCount.
+ *                  No status change, no vote-window push, no exitTimestamp. This is what stops the
+ *                  Exit modal from popping up on top of the Divert modal.
  */
 export function reduceFix(state: MachineState, fix: GpsFix, target: GeofenceTarget): MachineState {
   if (!isUsableFix(fix)) return state;
 
   const distanceM = haversineMeters(fix.latitude, fix.longitude, target.latitude, target.longitude);
   const next: MachineState = { ...state, lastFix: fix, distanceM, fixCount: state.fixCount + 1 };
+
+  // Freeze: the OS listener keeps delivering fixes (the live distance stays fresh), but the machine
+  // must not decide anything while the MR is filling in the Divert modal.
+  if (state.diverting) return next;
 
   if (state.status === 'PLANNED') {
     if (distanceM < target.radiusM && passesAccuracyFilter(fix)) {
@@ -134,6 +156,7 @@ export function reduceFix(state: MachineState, fix: GpsFix, target: GeofenceTarg
         recent: [],
         lastAcceptedFixTimestamp: fix.timestamp,
         dormantSince: null,
+        arrivedAt: fix.timestamp,
       };
     }
     return next;
@@ -183,10 +206,34 @@ export function reduceFix(state: MachineState, fix: GpsFix, target: GeofenceTarg
  * and AWAITING_FORM is already past the visit. Returns the SAME state object when nothing changes,
  * so a periodic tick never causes a re-render.
  *
+ * While `diverting` is true ticks are ignored too, so an open Divert modal cannot flip the status.
+ *
  * @param now Current epoch milliseconds (injected so the function stays pure and testable).
  */
 export function reduceTick(state: MachineState, now: number): MachineState {
+  if (state.diverting) return state;
   if (state.status !== 'ARRIVED' || state.lastAcceptedFixTimestamp === null) return state;
   if (now - state.lastAcceptedFixTimestamp < DORMANT_SILENCE_MS) return state;
   return { ...state, status: 'DORMANT', dormantSince: now };
+}
+
+/**
+ * START_DIVERT: the MR tapped Divert. Raises the freeze gate. Must be applied BEFORE the modal opens so
+ * the very next GPS callback already sees `diverting === true`.
+ * Ignored (same object) when already diverting, or when the status is AWAITING_FORM: that visit is
+ * already on the exit path and the Divert button is hidden there.
+ */
+export function reduceStartDivert(state: MachineState): MachineState {
+  if (state.diverting || state.status === 'AWAITING_FORM') return state;
+  return { ...state, diverting: true };
+}
+
+/**
+ * CANCEL_DIVERT: the MR closed the Divert modal without submitting. Lowers the gate. The vote window was
+ * never touched, so the next fix and tick simply continue under the normal rules.
+ * Returns the SAME object when not diverting.
+ */
+export function reduceCancelDivert(state: MachineState): MachineState {
+  if (!state.diverting) return state;
+  return { ...state, diverting: false };
 }

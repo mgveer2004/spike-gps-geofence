@@ -2,10 +2,11 @@ import { type Href, router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-import type { VisitResult } from '../../components/active-navigation';
+import type { DivertResult, VisitResult } from '../../components/active-navigation';
 import { ActiveNavigation } from '../../components/active-navigation';
 import { OutboxPanel } from '../../components/outbox-panel';
 import { useForegroundPermission } from '../../hooks/use-foreground-permission';
+import { saveDivertMock } from '../../outbox/mock-divert';
 import { useOutbox } from '../../state/outbox-context';
 import { useRoute } from '../../state/route-context';
 
@@ -41,6 +42,21 @@ export default function NavigateScreen() {
       exit_timestamp: new Date(result.exitTimestamp).toISOString(),
       form_answer: result.answer,
     });
+    setActiveIndex((i) => i + 1);
+  }
+
+  async function handleDivertSubmitted(result: DivertResult) {
+    // MOCK of the local-outbox-first save (in memory only, no SQLite / Supabase yet). It rejects on
+    // invalid input (e.g. REMOTE without a note), which keeps the Divert modal open.
+    await saveDivertMock({
+      doctorId: result.stop.id,
+      doctorName: result.stop.doctor_name,
+      snapshot: result.snapshot,
+      reason: result.reason,
+      note: result.note,
+    });
+    // The visit is now PENDING_REVISIT in the payload. Moving the index clears the active doctor:
+    // ActiveNavigation is keyed by target.id, so the next stop mounts fresh at PLANNED.
     setActiveIndex((i) => i + 1);
   }
 
@@ -109,7 +125,14 @@ export default function NavigateScreen() {
     );
   }
 
-  return <ActiveNavigation key={target.id} target={target} onSubmit={handleVisitSubmitted} />;
+  return (
+    <ActiveNavigation
+      key={target.id}
+      target={target}
+      onSubmit={handleVisitSubmitted}
+      onDivert={handleDivertSubmitted}
+    />
+  );
 }
 
 const styles = StyleSheet.create({

@@ -1,5 +1,5 @@
 import * as Location from 'expo-location';
-import { useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
 
 import {
   DORMANT_CHECK_INTERVAL_MS,
@@ -7,13 +7,21 @@ import {
   LOCATION_TIME_INTERVAL_MS,
   MAX_FIX_AGE_MS,
 } from '@/geofence/config';
-import { createInitialState, reduceFix, reduceTick } from '@/geofence/state-machine';
+import {
+  createInitialState,
+  reduceCancelDivert,
+  reduceFix,
+  reduceStartDivert,
+  reduceTick,
+} from '@/geofence/state-machine';
 import type { GeofenceTarget, MachineState } from '@/geofence/state-machine';
 import type { GpsFix, Stop } from '@/types/geofence';
 
 type Action =
   | { type: 'FIX'; fix: GpsFix; target: GeofenceTarget }
-  | { type: 'TICK'; now: number };
+  | { type: 'TICK'; now: number }
+  | { type: 'START_DIVERT' }
+  | { type: 'CANCEL_DIVERT' };
 
 function reducer(state: MachineState, action: Action): MachineState {
   switch (action.type) {
@@ -21,6 +29,10 @@ function reducer(state: MachineState, action: Action): MachineState {
       return reduceFix(state, action.fix, action.target);
     case 'TICK':
       return reduceTick(state, action.now);
+    case 'START_DIVERT':
+      return reduceStartDivert(state);
+    case 'CANCEL_DIVERT':
+      return reduceCancelDivert(state);
   }
 }
 
@@ -40,6 +52,8 @@ function toFix(loc: Location.LocationObject): GpsFix {
  * - Feeds every fresh fix into the pure geofence state machine.
  * - Runs a lightweight clock tick so the state machine can detect GPS silence (ARRIVED -> DORMANT)
  *   from timestamps. A DORMANT status wakes up by itself when the next fix arrives.
+ * - Exposes `startDivert` / `cancelDivert`. While a divert is open the reducer freezes the exit vote and the
+ *   silence clock; the GPS subscription itself keeps running so the live distance stays fresh.
  * Mount it with `key={stop.id}` so a new target starts from a clean PLANNED state.
  */
 export function useVisitTracker(stop: Stop) {
@@ -90,5 +104,9 @@ export function useVisitTracker(stop: Stop) {
     return () => clearInterval(id);
   }, []);
 
-  return { machine, gpsError };
+  // Same dispatch queue as the GPS callback, so any fix delivered after startDivert() already sees the freeze.
+  const startDivert = useCallback(() => dispatch({ type: 'START_DIVERT' }), []);
+  const cancelDivert = useCallback(() => dispatch({ type: 'CANCEL_DIVERT' }), []);
+
+  return { machine, gpsError, startDivert, cancelDivert };
 }

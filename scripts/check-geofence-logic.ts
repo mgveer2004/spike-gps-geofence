@@ -7,7 +7,9 @@ import { haversineMeters } from '../src/geofence/haversine';
 import {
   createInitialState,
   passesAccuracyFilter,
+  reduceCancelDivert,
   reduceFix,
+  reduceStartDivert,
   reduceTick,
   summarizeVote,
 } from '../src/geofence/state-machine';
@@ -367,6 +369,155 @@ check('after waking, the machine can go DORMANT again on a second silence', () =
   const again = reduceTick(woke, SILENCE_END + 1_000 + DORMANT_SILENCE_MS);
   assert.equal(again.status, 'DORMANT');
   assert.equal(again.dormantSince, SILENCE_END + 1_000 + DORMANT_SILENCE_MS);
+});
+
+// ---------- Context-Aware Divert: freeze, cancel, arrivedAt ----------
+console.log('DIVERT: arrivedAt, freeze, cancel');
+
+/** ARRIVED at ARRIVED_AT with two accurate inside fixes already in the vote window. */
+const arrivedWithWindow = () => feed(arrivedAtT0(), [fixAt(20, 5, 2_000), fixAt(20, 5, 3_000)]);
+const outAt = (t: number) => fixAt(90, 5, t);
+
+check('initial state is not diverting and has no arrivedAt', () => {
+  const s = createInitialState();
+  assert.equal(s.diverting, false);
+  assert.equal(s.arrivedAt, null);
+});
+
+check('arrivedAt is the timestamp of the PLANNED -> ARRIVED fix', () => {
+  const s = feed(createInitialState(), [fixAt(10, 100, 500), fixAt(10, 5, 1_000)]);
+  assert.equal(s.status, 'ARRIVED');
+  assert.equal(s.arrivedAt, 1_000); // not the earlier inaccurate fix
+});
+
+check('arrivedAt stays null while PLANNED (even with inaccurate or outside fixes)', () => {
+  const s = feed(createInitialState(), [fixAt(10, 100, 500), fixAt(90, 5, 600)]);
+  assert.equal(s.status, 'PLANNED');
+  assert.equal(s.arrivedAt, null);
+});
+
+check('arrivedAt is never overwritten by later fixes, DORMANT or wake-up', () => {
+  let s = arrivedWithWindow();
+  assert.equal(s.arrivedAt, ARRIVED_AT);
+  s = feed(s, [fixAt(20, 5, 4_000), fixAt(20, 5, 5_000)]);
+  assert.equal(s.arrivedAt, ARRIVED_AT);
+  assert.ok(s.lastAcceptedFixTimestamp !== ARRIVED_AT); // the thing arrivedAt must NOT be confused with
+  const dormant = reduceTick(s, 5_000 + DORMANT_SILENCE_MS);
+  assert.equal(dormant.status, 'DORMANT');
+  assert.equal(dormant.arrivedAt, ARRIVED_AT);
+  const woke = reduceFix(dormant, fixAt(20, 5, 5_000 + DORMANT_SILENCE_MS + 1_000), TARGET);
+  assert.equal(woke.status, 'ARRIVED');
+  assert.equal(woke.arrivedAt, ARRIVED_AT);
+});
+
+check('START_DIVERT raises the gate without touching the status', () => {
+  for (const before of [createInitialState(), arrivedWithWindow(), reduceTick(arrivedAtT0(), SILENCE_END)]) {
+    const s = reduceStartDivert(before);
+    assert.equal(s.diverting, true);
+    assert.equal(s.status, before.status);
+    assert.ok(s.window === before.window, 'window untouched');
+  }
+});
+
+check('START_DIVERT is ignored once AWAITING_FORM, and when already diverting', () => {
+  const exited = feed(arrived(), times(5, OUT));
+  assert.equal(exited.status, 'AWAITING_FORM');
+  assert.ok(reduceStartDivert(exited) === exited);
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  assert.ok(reduceStartDivert(diverting) === diverting);
+});
+
+check('CANCEL_DIVERT lowers the gate and is a no-op when not diverting', () => {
+  const idle = arrivedWithWindow();
+  assert.ok(reduceCancelDivert(idle) === idle);
+  const s = reduceCancelDivert(reduceStartDivert(idle));
+  assert.equal(s.diverting, false);
+  assert.equal(s.status, 'ARRIVED');
+});
+
+check('FREEZE: a majority-outside burst while diverting stays ARRIVED with the same window', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  const s = feed(diverting, Array.from({ length: 10 }, (_, i) => outAt(10_000 + i * 5_000)));
+  assert.equal(s.status, 'ARRIVED');
+  assert.equal(s.exitTimestamp, null);
+  assert.ok(s.window === diverting.window, 'window array is the very same object');
+  assert.equal(s.window.length, 2);
+  assert.ok(s.recent === diverting.recent, 'debug log untouched too');
+  assert.equal(s.diverting, true);
+});
+
+check('FREEZE: live distance / lastFix / fixCount still update while diverting', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  const s = feed(diverting, [outAt(10_000), outAt(15_000)]);
+  assert.equal(s.fixCount, diverting.fixCount + 2);
+  assert.equal(s.lastFix?.timestamp, 15_000);
+  assert.ok(s.distanceM !== null && Math.abs(s.distanceM - 90) < 1);
+});
+
+check('FREEZE: lastAcceptedFixTimestamp and arrivedAt are not moved by fixes while diverting', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  const s = feed(diverting, [outAt(10_000)]);
+  assert.equal(s.lastAcceptedFixTimestamp, diverting.lastAcceptedFixTimestamp);
+  assert.equal(s.arrivedAt, ARRIVED_AT);
+});
+
+check('FREEZE: unusable fixes are still ignored entirely while diverting', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  const bad: GpsFix = { latitude: NaN, longitude: 0, accuracy: 5, timestamp: 9_000 };
+  assert.ok(reduceFix(diverting, bad, TARGET) === diverting);
+});
+
+check('FREEZE: ticks during a divert never change the status (no ARRIVED -> DORMANT)', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow());
+  assert.ok(reduceTick(diverting, 10 * DORMANT_SILENCE_MS) === diverting);
+  assert.equal(reduceTick(diverting, 10 * DORMANT_SILENCE_MS).status, 'ARRIVED');
+});
+
+check('FREEZE: a DORMANT machine stays DORMANT (dormantSince kept) on an accurate fix while diverting', () => {
+  const dormant = reduceTick(arrivedWithWindow(), 3_000 + DORMANT_SILENCE_MS);
+  assert.equal(dormant.status, 'DORMANT');
+  const diverting = reduceStartDivert(dormant);
+  const s = feed(diverting, [fixAt(20, 5, 3_000 + DORMANT_SILENCE_MS + 1_000)]);
+  assert.equal(s.status, 'DORMANT');
+  assert.equal(s.dormantSince, dormant.dormantSince);
+  assert.ok(s.window === dormant.window);
+});
+
+check('FREEZE: PLANNED does not become ARRIVED while diverting (the reason list cannot flip)', () => {
+  const diverting = reduceStartDivert(createInitialState());
+  const s = feed(diverting, [fixAt(10, 5, 1_000), fixAt(10, 5, 2_000)]);
+  assert.equal(s.status, 'PLANNED');
+  assert.equal(s.arrivedAt, null);
+  assert.ok(s.distanceM !== null && Math.abs(s.distanceM - 10) < 1); // distance evidence stays live
+  // ...and after cancel the normal entry rule applies again.
+  const resumed = feed(reduceCancelDivert(s), [fixAt(10, 5, 3_000)]);
+  assert.equal(resumed.status, 'ARRIVED');
+  assert.equal(resumed.arrivedAt, 3_000);
+});
+
+check('CANCEL: fixes that arrived during the divert never count toward the exit vote', () => {
+  const diverting = reduceStartDivert(arrivedWithWindow()); // window: in, in
+  const during = feed(diverting, Array.from({ length: 10 }, (_, i) => outAt(10_000 + i * 5_000)));
+  let s = reduceCancelDivert(during);
+  assert.equal(s.status, 'ARRIVED');
+  assert.equal(s.window.length, 2);
+  // Had the 10 frozen fixes counted, the very first fresh fix would exit. It must not.
+  s = reduceFix(s, outAt(100_000), TARGET);
+  assert.equal(s.status, 'ARRIVED'); // in, in, out = 3 valid (< 5)
+  s = reduceFix(s, outAt(105_000), TARGET);
+  assert.equal(s.status, 'ARRIVED'); // in, in, out, out = 4 valid (< 5)
+});
+
+check('CANCEL: after cancel a real exit still fires through the normal majority vote', () => {
+  const during = feed(reduceStartDivert(arrivedWithWindow()), times(10, () => outAt(10_000)));
+  const s = feed(reduceCancelDivert(during), [outAt(100_000), outAt(105_000), outAt(110_000)]);
+  assert.equal(s.status, 'AWAITING_FORM'); // in, in, out, out, out = 3/5 outside
+  assert.equal(s.exitTimestamp, 110_000);
+});
+
+check('CANCEL: ticks resume under the normal rules after the modal closes', () => {
+  const cancelled = reduceCancelDivert(reduceStartDivert(arrivedWithWindow()));
+  assert.equal(reduceTick(cancelled, 3_000 + DORMANT_SILENCE_MS).status, 'DORMANT');
 });
 
 console.log(`\nAll ${passed} checks passed.`);
